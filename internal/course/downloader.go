@@ -115,9 +115,11 @@ func (d *CourseDownloader) DownloadArticle(course geektime.Course, productType u
 	}
 
 	if geektime.IsTextCourse(course) {
-		d.downloadingSpinner.Prefix = fmt.Sprintf("[ 正在下载 《%s》... ]", article.Title)
-		d.downloadingSpinner.Start()
-		defer d.downloadingSpinner.Stop()
+		if d.downloadingSpinner != nil {
+			d.downloadingSpinner.Prefix = fmt.Sprintf("[ 正在下载 《%s》... ]", article.Title)
+			d.downloadingSpinner.Start()
+			defer d.downloadingSpinner.Stop()
+		}
 		skip := d.skipDownloadTextArticle(article, columnDir, overwrite)
 		if skip {
 			return nil
