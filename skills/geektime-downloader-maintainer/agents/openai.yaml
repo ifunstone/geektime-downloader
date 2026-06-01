@@ -1,4 +1,4 @@
 interface:
   display_name: "Geektime Downloader Maintainer"
-  short_description: "Guide changes in Geektime Downloader"
-  default_prompt: "Use $geektime-downloader-maintainer to modify or extend this repository safely."
+  short_description: "Route GUI, download, and conversion changes correctly"
+  default_prompt: "Use $geektime-downloader-maintainer to update the Geektime Downloader GUI, download flows, or TS-to-MP4 conversion paths safely."
