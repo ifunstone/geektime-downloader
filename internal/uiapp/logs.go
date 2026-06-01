@@ -8,14 +8,21 @@ import (
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/logger"
 )
 
-const maxUILogBytes int64 = 128 * 1024
+const maxUILogBytes int64 = 32 * 1024
+
+func logFilePath() (string, error) {
+	userConfigDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(userConfigDir, logger.GeektimeLogFolder, logger.GeektimeLogFolder+".log"), nil
+}
 
 func readLogFile() string {
-	userConfigDir, err := os.UserConfigDir()
+	logFilePath, err := logFilePath()
 	if err != nil {
 		return "无法读取日志目录"
 	}
-	logFilePath := filepath.Join(userConfigDir, logger.GeektimeLogFolder, logger.GeektimeLogFolder+".log")
 	data, truncated, err := readTailFile(logFilePath, maxUILogBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -27,9 +34,21 @@ func readLogFile() string {
 		return "日志文件为空"
 	}
 	if truncated {
-		return "[日志过大，仅显示最后 128KB]\n" + string(data)
+		return "[日志过大，仅显示最后 32KB]\n" + string(data)
 	}
 	return string(data)
+}
+
+func deleteLogFile() error {
+	path, err := logFilePath()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func readTailFile(path string, maxBytes int64) ([]byte, bool, error) {

@@ -23,8 +23,10 @@ type Part struct {
 	Offset int64
 }
 
+type ProgressFunc func(downloadedBytes int64, totalBytes int64)
+
 // DownloadFileConcurrently download file in chunks, return total file size
-func DownloadFileConcurrently(ctx context.Context, filepath string, url string, headers map[string]string, concurrency int) (int64, error) {
+func DownloadFileConcurrently(ctx context.Context, filepath string, url string, headers map[string]string, concurrency int, progress ProgressFunc) (int64, error) {
 	// Use HEAD with context so it can be cancelled by parent ctx (Ctrl+C)
 	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
@@ -51,6 +53,9 @@ func DownloadFileConcurrently(ctx context.Context, filepath string, url string, 
 		defer func() {
 			_ = out.Close()
 		}()
+		if progress != nil {
+			progress(0, 0)
+		}
 		return fileSize, nil
 	}
 
@@ -97,6 +102,7 @@ func DownloadFileConcurrently(ctx context.Context, filepath string, url string, 
 	nextIndex := 0
 	pending := make(map[int]Part, concurrency)
 	var writeErr error
+	var writtenTotal int64
 
 	for part := range results {
 		if writeErr != nil {
@@ -112,6 +118,10 @@ func DownloadFileConcurrently(ctx context.Context, filepath string, url string, 
 			if err != nil {
 				writeErr = err
 				break
+			}
+			writtenTotal += int64(len(nextPart.Data))
+			if progress != nil {
+				progress(writtenTotal, fileSize)
 			}
 			delete(pending, nextIndex)
 			nextIndex++

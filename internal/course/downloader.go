@@ -22,6 +22,7 @@ import (
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/filenamify"
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/files"
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/logger"
+	"github.com/nicoxiang/geektime-downloader/internal/progress"
 	"github.com/nicoxiang/geektime-downloader/internal/ui"
 	"github.com/nicoxiang/geektime-downloader/internal/video"
 )
@@ -39,9 +40,10 @@ type CourseDownloader struct {
 	concurrency        int
 	waitRand           *rand.Rand
 	downloadingSpinner *spinner.Spinner
+	progress           progress.Func
 }
 
-func NewCourseDownloader(ctx context.Context, cfg *config.AppConfig, geektimeClient *geektime.Client, sp *spinner.Spinner) *CourseDownloader {
+func NewCourseDownloader(ctx context.Context, cfg *config.AppConfig, geektimeClient *geektime.Client, sp *spinner.Spinner, progressFn progress.Func) *CourseDownloader {
 	concurrency := int(math.Ceil(float64(runtime.NumCPU()) / 2.0))
 	if concurrency <= 0 {
 		concurrency = 1
@@ -53,6 +55,7 @@ func NewCourseDownloader(ctx context.Context, cfg *config.AppConfig, geektimeCli
 		concurrency:        concurrency,
 		waitRand:           rand.New(rand.NewSource(time.Now().UnixNano())),
 		downloadingSpinner: sp,
+		progress:           progressFn,
 	}
 }
 
@@ -70,6 +73,7 @@ func (d *CourseDownloader) DownloadAll(course geektime.Course, productType ui.Pr
 		var downloaded int
 
 		for _, article := range course.Articles {
+			d.reportArticleProgress(course.Title, article.Title, "starting", downloaded+1, total, 0, 0)
 			skip := d.skipDownloadTextArticle(article, columnDir, false)
 			if !skip {
 				logger.Infof("Begin download article, articleID: %d, articleTitle: %s", article.AID, article.Title)
@@ -79,9 +83,12 @@ func (d *CourseDownloader) DownloadAll(course geektime.Course, productType ui.Pr
 				d.waitRandomTime()
 			}
 			increaseDownloadedTextArticleCount(total, &downloaded)
+			d.reportArticleProgress(course.Title, article.Title, "completed", downloaded, total, 1, 1)
 		}
 	} else {
-		for _, article := range course.Articles {
+		total := len(course.Articles)
+		for index, article := range course.Articles {
+			d.reportArticleProgress(course.Title, article.Title, "starting", index+1, total, 0, 0)
 			skip := d.skipDownloadVideoArticle(article, columnDir, false)
 			// 训练营特殊处理，训练营只能从文章详情中获取当前文章是否是视频，训练营目前只支持下载视频类文章，
 			// 下载所有时如果是文本类，直接跳过
@@ -95,11 +102,12 @@ func (d *CourseDownloader) DownloadAll(course geektime.Course, productType ui.Pr
 				}
 			}
 			if !skip {
-				if err := d.downloadVideoArticle(course, productType, article, columnDir); err != nil {
+				if err := d.downloadVideoArticle(course, productType, article, columnDir, index+1, total); err != nil {
 					return err
 				}
 				d.waitRandomTime()
 			}
+			d.reportArticleProgress(course.Title, article.Title, "completed", index+1, total, 1, 1)
 		}
 	}
 
@@ -124,13 +132,23 @@ func (d *CourseDownloader) DownloadArticle(course geektime.Course, productType u
 		if skip {
 			return nil
 		}
-		return d.downloadTextArticle(article, columnDir, overwrite)
+		d.reportArticleProgress(course.Title, article.Title, "starting", 1, 1, 0, 0)
+		err := d.downloadTextArticle(article, columnDir, overwrite)
+		if err == nil {
+			d.reportArticleProgress(course.Title, article.Title, "completed", 1, 1, 1, 1)
+		}
+		return err
 	} else {
 		skip := d.skipDownloadVideoArticle(article, columnDir, overwrite)
 		if skip {
 			return nil
 		}
-		return d.downloadVideoArticle(course, productType, article, columnDir)
+		d.reportArticleProgress(course.Title, article.Title, "starting", 1, 1, 0, 0)
+		err := d.downloadVideoArticle(course, productType, article, columnDir, 1, 1)
+		if err == nil {
+			d.reportArticleProgress(course.Title, article.Title, "completed", 1, 1, 1, 1)
+		}
+		return err
 	}
 }
 
@@ -141,7 +159,18 @@ func (d *CourseDownloader) DownloadSingleVideoProduct(title string, articleID in
 	if err != nil {
 		return err
 	}
-	return video.DownloadArticleVideo(d.ctx, d.geektimeClient, articleID, sourceType, columnDir, d.cfg.Quality, d.concurrency)
+	return video.DownloadArticleVideo(
+		d.ctx,
+		d.geektimeClient,
+		articleID,
+		sourceType,
+		columnDir,
+		d.cfg.Quality,
+		d.concurrency,
+		func(downloadedBytes int64, totalBytes int64) {
+			d.reportArticleProgress(title, title, "downloading", 1, 1, downloadedBytes, totalBytes)
+		},
+	)
 }
 
 func increaseDownloadedTextArticleCount(total int, downloaded *int) {
@@ -198,7 +227,7 @@ func (d *CourseDownloader) downloadTextArticle(article geektime.Article, columnD
 
 	hasVideo, videoURL := getVideoURLFromArticleContent(articleInfo.Data.ArticleContent)
 	if hasVideo && videoURL != "" {
-		if err := video.DownloadMP4(d.ctx, article.Title, columnDir, []string{videoURL}, overwrite); err != nil {
+		if err := video.DownloadMP4(d.ctx, article.Title, columnDir, []string{videoURL}, overwrite, nil); err != nil {
 			return err
 		}
 	}
@@ -208,7 +237,7 @@ func (d *CourseDownloader) downloadTextArticle(article geektime.Article, columnD
 		for i, v := range articleInfo.Data.InlineVideoSubtitles {
 			videoURLs[i] = v.VideoURL
 		}
-		if err := video.DownloadMP4(d.ctx, article.Title, columnDir, videoURLs, overwrite); err != nil {
+		if err := video.DownloadMP4(d.ctx, article.Title, columnDir, videoURLs, overwrite, nil); err != nil {
 			return err
 		}
 	}
@@ -257,7 +286,7 @@ func (d *CourseDownloader) skipDownloadVideoArticle(article geektime.Article, co
 // downloadVideoArticle downloads a video article to the specified column directory.
 // It handles different types of video content including university courses, enterprise content,
 // and regular article videos.
-func (d *CourseDownloader) downloadVideoArticle(course geektime.Course, productType ui.ProductTypeSelectOption, article geektime.Article, columnDir string) error {
+func (d *CourseDownloader) downloadVideoArticle(course geektime.Course, productType ui.ProductTypeSelectOption, article geektime.Article, columnDir string, currentItem int, totalItems int) error {
 	dir := columnDir
 	var err error
 	if article.SectionTitle != "" {
@@ -268,13 +297,34 @@ func (d *CourseDownloader) downloadVideoArticle(course geektime.Course, productT
 	}
 
 	if productType.IsUniversity() {
-		err = video.DownloadUniversityVideo(d.ctx, d.geektimeClient, article.AID, course, dir, d.cfg.Quality, d.concurrency)
+		err = video.DownloadUniversityVideo(d.ctx, d.geektimeClient, article.AID, course, dir, d.cfg.Quality, d.concurrency, func(downloadedBytes int64, totalBytes int64) {
+			d.reportArticleProgress(course.Title, article.Title, "downloading", currentItem, totalItems, downloadedBytes, totalBytes)
+		})
 	} else if d.cfg.IsEnterprise {
-		err = video.DownloadEnterpriseArticleVideo(d.ctx, d.geektimeClient, article.AID, dir, d.cfg.Quality, d.concurrency)
+		err = video.DownloadEnterpriseArticleVideo(d.ctx, d.geektimeClient, article.AID, dir, d.cfg.Quality, d.concurrency, func(downloadedBytes int64, totalBytes int64) {
+			d.reportArticleProgress(course.Title, article.Title, "downloading", currentItem, totalItems, downloadedBytes, totalBytes)
+		})
 	} else {
-		err = video.DownloadArticleVideo(d.ctx, d.geektimeClient, article.AID, productType.SourceType, dir, d.cfg.Quality, d.concurrency)
+		err = video.DownloadArticleVideo(d.ctx, d.geektimeClient, article.AID, productType.SourceType, dir, d.cfg.Quality, d.concurrency, func(downloadedBytes int64, totalBytes int64) {
+			d.reportArticleProgress(course.Title, article.Title, "downloading", currentItem, totalItems, downloadedBytes, totalBytes)
+		})
 	}
 	return err
+}
+
+func (d *CourseDownloader) reportArticleProgress(courseTitle, articleTitle, stage string, currentItem, totalItems int, downloadedBytes, totalBytes int64) {
+	if d.progress == nil {
+		return
+	}
+	d.progress(progress.Download{
+		CourseTitle:     courseTitle,
+		ItemTitle:       articleTitle,
+		Stage:           stage,
+		CurrentItem:     currentItem,
+		TotalItems:      totalItems,
+		DownloadedBytes: downloadedBytes,
+		TotalBytes:      totalBytes,
+	})
 }
 
 // mkDownloadColumnDir creates a directory for downloading a column with the given columnName.

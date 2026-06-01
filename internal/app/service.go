@@ -10,6 +10,7 @@ import (
 	"github.com/nicoxiang/geektime-downloader/internal/course"
 	"github.com/nicoxiang/geektime-downloader/internal/geektime"
 	"github.com/nicoxiang/geektime-downloader/internal/pkg/logger"
+	"github.com/nicoxiang/geektime-downloader/internal/progress"
 )
 
 type ProductTypeOption struct {
@@ -38,6 +39,7 @@ type Service struct {
 	ctx    context.Context
 	cfg    *config.AppConfig
 	client *geektime.Client
+	progress progress.Func
 }
 
 func DefaultConfig() config.AppConfig {
@@ -77,7 +79,7 @@ func (p ProductTypeOption) IsUniversity() bool {
 	return p.Index == 4 && !p.IsEnterpriseMode
 }
 
-func NewService(ctx context.Context, cfg *config.AppConfig) (*Service, error) {
+func NewService(ctx context.Context, cfg *config.AppConfig, progressFn progress.Func) (*Service, error) {
 	if err := config.ValidateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -88,6 +90,7 @@ func NewService(ctx context.Context, cfg *config.AppConfig) (*Service, error) {
 		ctx:    ctx,
 		cfg:    cfg,
 		client: client,
+		progress: progressFn,
 	}, nil
 }
 
@@ -135,9 +138,18 @@ func (s *Service) ResolveProduct(productType ProductTypeOption, productID int) (
 }
 
 func (s *Service) DownloadAll(result *SelectionResult) error {
-	downloader := course.NewCourseDownloader(s.ctx, s.cfg, s.client, nil)
+	downloader := course.NewCourseDownloader(s.ctx, s.cfg, s.client, nil, s.progress)
 
 	if result.IsDirectMode && result.DirectVideo != nil {
+		if s.progress != nil {
+			s.progress(progress.Download{
+				CourseTitle: result.Course.Title,
+				ItemTitle:   result.DirectVideo.Title,
+				Stage:       "starting",
+				CurrentItem: 1,
+				TotalItems:  1,
+			})
+		}
 		return downloader.DownloadSingleVideoProduct(
 			result.DirectVideo.Title,
 			result.DirectVideo.ArticleID,
@@ -168,7 +180,7 @@ func (s *Service) DownloadArticle(result *SelectionResult, articleIndex int) err
 		}
 	}
 
-	downloader := course.NewCourseDownloader(s.ctx, s.cfg, s.client, nil)
+	downloader := course.NewCourseDownloader(s.ctx, s.cfg, s.client, nil, s.progress)
 	return downloader.DownloadArticle(result.Course, toLegacyOption(result.ProductType), article, true)
 }
 

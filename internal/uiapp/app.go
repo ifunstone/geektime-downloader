@@ -6,16 +6,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	fyneapp "fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/nicoxiang/geektime-downloader/internal/app"
 	"github.com/nicoxiang/geektime-downloader/internal/config"
+	"github.com/nicoxiang/geektime-downloader/internal/progress"
 )
 
 type UI struct {
@@ -28,23 +32,29 @@ type UI struct {
 	selectedType   *app.ProductTypeOption
 	selection      *app.SelectionResult
 
-	productTypeSelect *widget.Select
-	articleSelect     *widget.Select
+	productTypeSelect *ScrollableSelect
+	articleSelect     *ScrollableSelect
 	statusLabel       *widget.Label
 	courseLabel       *widget.Label
-	progressBar       *widget.ProgressBarInfinite
-	logEntry          *widget.Entry
+	progressBar       *widget.ProgressBar
+	progressDetailLabel *widget.Label
+	logEntry          *canvas.Text
+	logScroll         *container.Scroll
+	tabs              *container.AppTabs
 	loadButton        *widget.Button
 	downloadAllButton *widget.Button
 	downloadOneButton *widget.Button
+	pauseButton       *widget.Button
+	cancelButton      *widget.Button
 	refreshLogButton  *widget.Button
+	deleteLogButton   *widget.Button
 	saveConfigButton  *widget.Button
 
 	gcidEntry            *widget.Entry
 	gcessEntry           *widget.Entry
 	downloadFolderEntry  *widget.Entry
-	qualitySelect        *widget.Select
-	commentsSelect       *widget.Select
+	qualitySelect        *ScrollableSelect
+	commentsSelect       *ScrollableSelect
 	outputPDFCheck       *widget.Check
 	outputMarkdownCheck  *widget.Check
 	outputAudioCheck     *widget.Check
@@ -52,8 +62,14 @@ type UI struct {
 	printPDFTimeoutEntry *widget.Entry
 	intervalEntry        *widget.Entry
 	enterpriseCheck      *widget.Check
-	logLevelSelect       *widget.Select
+	logLevelSelect       *ScrollableSelect
 	productIDEntry       *widget.Entry
+
+	taskMu       sync.Mutex
+	activeTask   *downloadTaskState
+	activeCancel context.CancelFunc
+	lastLogText  string
+	logTabActive bool
 }
 
 type appConfigState struct {
@@ -72,6 +88,22 @@ type appConfigState struct {
 	OutputAudio            bool
 	ProductID              string
 	ProductType            string
+}
+
+type downloadTaskKind int
+
+const (
+	taskNone downloadTaskKind = iota
+	taskDownloadAll
+	taskDownloadOne
+)
+
+type downloadTaskState struct {
+	kind         downloadTaskKind
+	selection    *app.SelectionResult
+	articleIndex int
+	paused       bool
+	running      bool
 }
 
 func Run(ctx context.Context) {
@@ -112,12 +144,17 @@ func (u *UI) build(ctx context.Context) {
 	u.statusLabel.Wrapping = fyne.TextWrapWord
 	u.courseLabel = widget.NewLabel("尚未加载课程")
 	u.courseLabel.Wrapping = fyne.TextWrapWord
-	u.progressBar = widget.NewProgressBarInfinite()
+	u.progressBar = widget.NewProgressBar()
+	u.progressBar.Min = 0
+	u.progressBar.Max = 1
+	u.progressBar.SetValue(0)
 	u.progressBar.Hide()
-	u.logEntry = widget.NewMultiLineEntry()
-	u.logEntry.Disable()
-	u.logEntry.Wrapping = fyne.TextWrapWord
-	u.logEntry.SetMinRowsVisible(14)
+	u.progressDetailLabel = widget.NewLabel("当前无下载任务")
+	u.progressDetailLabel.Wrapping = fyne.TextWrapWord
+	u.logEntry = canvas.NewText("", theme.Color(theme.ColorNameWarning))
+	u.logEntry.TextStyle = fyne.TextStyle{Monospace: true}
+	u.logEntry.TextSize = theme.TextSize()
+	u.logScroll = container.NewScroll(u.logEntry)
 
 	u.gcidEntry = widget.NewPasswordEntry()
 	u.gcidEntry.SetPlaceHolder("输入 GCID")
@@ -131,17 +168,17 @@ func (u *UI) build(ctx context.Context) {
 	u.productIDEntry.SetPlaceHolder("输入课程 ID")
 	u.productIDEntry.SetText(u.cfg.ProductID)
 
-	u.qualitySelect = widget.NewSelect([]string{"ld", "sd", "hd"}, func(value string) {
+	u.qualitySelect = NewScrollableSelect([]string{"ld", "sd", "hd"}, func(value string) {
 		u.cfg.Quality = value
 	})
 	u.qualitySelect.SetSelected(u.cfg.Quality)
 
-	u.commentsSelect = widget.NewSelect([]string{"0", "1", "2"}, func(value string) {
+	u.commentsSelect = NewScrollableSelect([]string{"0", "1", "2"}, func(value string) {
 		u.cfg.DownloadComments = value
 	})
 	u.commentsSelect.SetSelected(u.cfg.DownloadComments)
 
-	u.logLevelSelect = widget.NewSelect([]string{"debug", "info", "warn", "error", "none"}, func(value string) {
+	u.logLevelSelect = NewScrollableSelect([]string{"debug", "info", "warn", "error", "none"}, func(value string) {
 		u.cfg.LogLevel = value
 	})
 	u.logLevelSelect.SetSelected(u.cfg.LogLevel)
@@ -172,7 +209,7 @@ func (u *UI) build(ctx context.Context) {
 	})
 	u.enterpriseCheck.SetChecked(u.cfg.IsEnterprise)
 
-	u.productTypeSelect = widget.NewSelect(nil, func(value string) {
+	u.productTypeSelect = NewScrollableSelect(nil, func(value string) {
 		for i := range u.productOptions {
 			if u.productOptions[i].Text == value {
 				u.selectedType = &u.productOptions[i]
@@ -181,7 +218,7 @@ func (u *UI) build(ctx context.Context) {
 		}
 	})
 
-	u.articleSelect = widget.NewSelect(nil, nil)
+	u.articleSelect = NewScrollableSelect(nil, nil)
 	u.articleSelect.PlaceHolder = "课程文章列表"
 
 	u.loadButton = widget.NewButton("加载课程", func() {
@@ -193,8 +230,17 @@ func (u *UI) build(ctx context.Context) {
 	u.downloadOneButton = widget.NewButton("下载选中文章", func() {
 		u.downloadSelectedArticle(ctx)
 	})
+	u.pauseButton = widget.NewButton("暂停下载", func() {
+		u.togglePauseDownload(ctx)
+	})
+	u.cancelButton = widget.NewButton("取消下载", func() {
+		u.cancelDownload()
+	})
 	u.refreshLogButton = widget.NewButton("刷新日志", func() {
 		u.refreshLogView()
+	})
+	u.deleteLogButton = widget.NewButton("删除日志", func() {
+		u.confirmDeleteLog()
 	})
 	u.saveConfigButton = widget.NewButton("保存配置", func() {
 		if err := u.persistSettings(); err != nil {
@@ -205,6 +251,8 @@ func (u *UI) build(ctx context.Context) {
 	})
 	u.downloadAllButton.Disable()
 	u.downloadOneButton.Disable()
+	u.pauseButton.Disable()
+	u.cancelButton.Disable()
 
 	u.refreshProductOptions()
 	u.restoreSelectedProductType()
@@ -214,22 +262,31 @@ func (u *UI) build(ctx context.Context) {
 	settingsPage := container.NewPadded(u.buildSettingsPage())
 	logPage := container.NewPadded(u.buildLogPage())
 
-	tabs := container.NewAppTabs(
+	u.tabs = container.NewAppTabs(
 		container.NewTabItem("下载操作", downloadPage),
 		container.NewTabItem("参数配置", settingsPage),
 		container.NewTabItem("日志查看", logPage),
 	)
-	tabs.SetTabLocation(container.TabLocationTop)
+	u.tabs.SetTabLocation(container.TabLocationTop)
+	u.tabs.OnSelected = func(item *container.TabItem) {
+		u.logTabActive = item != nil && item.Text == "日志查看"
+		if u.logTabActive {
+			u.refreshLogView()
+		}
+	}
 
 	content := container.NewBorder(
 		nil,
 		container.NewVBox(widget.NewSeparator(), u.statusLabel),
 		nil,
 		nil,
-		tabs,
+		u.tabs,
 	)
 
 	u.window.SetContent(content)
+	if current := u.tabs.Selected(); current != nil && current.Text == "日志查看" {
+		u.logTabActive = true
+	}
 	u.window.SetCloseIntercept(func() {
 		_ = u.persistSettings()
 		u.window.Close()
@@ -245,8 +302,10 @@ func (u *UI) buildDownloadPage() fyne.CanvasObject {
 			widget.NewFormItem("课程 ID", u.productIDEntry),
 		),
 		container.NewHBox(u.loadButton, u.downloadAllButton, u.downloadOneButton),
+		container.NewHBox(u.pauseButton, u.cancelButton),
 		u.courseLabel,
 		u.progressBar,
+		u.progressDetailLabel,
 		widget.NewLabel("文章选择"),
 		u.articleSelect,
 	)
@@ -275,10 +334,10 @@ func (u *UI) buildSettingsPage() fyne.CanvasObject {
 func (u *UI) buildLogPage() fyne.CanvasObject {
 	return container.NewBorder(
 		widget.NewLabel("运行日志"),
-		container.NewHBox(u.refreshLogButton),
+		container.NewHBox(u.refreshLogButton, u.deleteLogButton),
 		nil,
 		nil,
-		u.logEntry,
+		u.logScroll,
 	)
 }
 
@@ -381,25 +440,9 @@ func (u *UI) downloadAll(ctx context.Context) {
 		u.showError(fmt.Errorf("请先加载课程"))
 		return
 	}
-	svc, err := u.newService(ctx)
-	if err != nil {
-		u.showError(err)
-		return
-	}
 	selection := u.selection
-	u.setBusy(true, "正在下载全部内容，执行期间界面不会展示细粒度进度")
-	go func() {
-		err := svc.DownloadAll(selection)
-		fyne.Do(func() {
-			u.setBusy(false, "")
-			u.refreshLogView()
-			if err != nil {
-				u.showError(err)
-				return
-			}
-			u.statusLabel.SetText("下载完成")
-		})
-	}()
+	u.setBusy(true, "正在下载全部内容...")
+	u.runTask(ctx, downloadTaskState{kind: taskDownloadAll, selection: selection, articleIndex: -1})
 }
 
 func (u *UI) downloadSelectedArticle(ctx context.Context) {
@@ -424,25 +467,9 @@ func (u *UI) downloadSelectedArticle(ctx context.Context) {
 		return
 	}
 
-	svc, err := u.newService(ctx)
-	if err != nil {
-		u.showError(err)
-		return
-	}
 	selection := u.selection
 	u.setBusy(true, "正在下载选中文章...")
-	go func() {
-		err := svc.DownloadArticle(selection, index)
-		fyne.Do(func() {
-			u.setBusy(false, "")
-			u.refreshLogView()
-			if err != nil {
-				u.showError(err)
-				return
-			}
-			u.statusLabel.SetText("文章下载完成")
-		})
-	}()
+	u.runTask(ctx, downloadTaskState{kind: taskDownloadOne, selection: selection, articleIndex: index})
 }
 
 func (u *UI) newService(ctx context.Context) (*app.Service, error) {
@@ -450,7 +477,7 @@ func (u *UI) newService(ctx context.Context) (*app.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return app.NewService(ctx, &cfg)
+	return app.NewService(ctx, &cfg, u.handleDownloadProgress)
 }
 
 func (u *UI) buildConfig() (config.AppConfig, error) {
@@ -504,16 +531,26 @@ func (u *UI) setBusy(busy bool, status string) {
 	u.statusLabel.SetText(status)
 	if busy {
 		u.progressBar.Show()
+		u.progressBar.SetValue(0)
+		u.progressDetailLabel.SetText("准备开始...")
 		u.loadButton.Disable()
 		u.downloadAllButton.Disable()
 		u.downloadOneButton.Disable()
+		u.pauseButton.Enable()
+		u.pauseButton.SetText("暂停下载")
+		u.cancelButton.Enable()
 		u.saveConfigButton.Disable()
 		u.refreshLogButton.Disable()
 		return
 	}
 
 	u.progressBar.Hide()
+	u.progressBar.SetValue(0)
+	u.progressDetailLabel.SetText("当前无下载任务")
 	u.loadButton.Enable()
+	u.pauseButton.Disable()
+	u.pauseButton.SetText("暂停下载")
+	u.cancelButton.Disable()
 	u.saveConfigButton.Enable()
 	u.refreshLogButton.Enable()
 	if u.selection != nil {
@@ -524,6 +561,157 @@ func (u *UI) setBusy(busy bool, status string) {
 	}
 }
 
+func (u *UI) handleDownloadProgress(download progress.Download) {
+	fyne.Do(func() {
+		u.progressBar.Show()
+		if download.TotalBytes > 0 {
+			value := float64(download.DownloadedBytes) / float64(download.TotalBytes)
+			if value < 0 {
+				value = 0
+			}
+			if value > 1 {
+				value = 1
+			}
+			u.progressBar.SetValue(value)
+			u.progressDetailLabel.SetText(fmt.Sprintf(
+				"当前课程进度：%d/%d | 当前条目：%s | 视频下载 %.1f%%",
+				download.CurrentItem,
+				max(download.TotalItems, 1),
+				download.ItemTitle,
+				value*100,
+			))
+			return
+		}
+
+		u.progressBar.SetValue(0)
+		u.progressDetailLabel.SetText(fmt.Sprintf(
+			"当前课程进度：%d/%d | 当前条目：%s | 状态：%s",
+			download.CurrentItem,
+			max(download.TotalItems, 1),
+			download.ItemTitle,
+			download.Stage,
+		))
+	})
+}
+
+func (u *UI) finishTask(err error, fromResume bool) bool {
+	u.taskMu.Lock()
+	defer u.taskMu.Unlock()
+	if u.activeTask == nil {
+		return false
+	}
+	if err == context.Canceled {
+		if u.activeTask.paused {
+			u.activeTask.running = false
+			u.activeCancel = nil
+			u.progressBar.Hide()
+			u.pauseButton.SetText("继续下载")
+			u.cancelButton.Enable()
+			u.loadButton.Enable()
+			u.saveConfigButton.Enable()
+			u.refreshLogButton.Enable()
+			u.progressDetailLabel.SetText("下载已暂停，可继续")
+			u.statusLabel.SetText("下载已暂停")
+			return true
+		}
+		u.activeTask = nil
+		u.activeCancel = nil
+		u.setBusy(false, "")
+		u.statusLabel.SetText("下载已取消")
+		return true
+	}
+	u.activeTask = nil
+	u.activeCancel = nil
+	return false
+}
+
+func (u *UI) togglePauseDownload(baseCtx context.Context) {
+	u.taskMu.Lock()
+	task := u.activeTask
+	cancel := u.activeCancel
+	if task == nil {
+		u.taskMu.Unlock()
+		return
+	}
+	if task.running {
+		task.paused = true
+		u.taskMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	if !task.paused {
+		u.taskMu.Unlock()
+		return
+	}
+	resumeTask := *task
+	resumeTask.paused = false
+	resumeTask.running = true
+	u.taskMu.Unlock()
+
+	u.pauseButton.SetText("暂停下载")
+	u.cancelButton.Enable()
+	u.setBusy(true, "正在继续下载...")
+	u.runTask(baseCtx, resumeTask)
+}
+
+func (u *UI) cancelDownload() {
+	u.taskMu.Lock()
+	cancel := u.activeCancel
+	u.taskMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (u *UI) runTask(baseCtx context.Context, task downloadTaskState) {
+	runCtx, cancel := context.WithCancel(baseCtx)
+	u.taskMu.Lock()
+	u.activeCancel = cancel
+	u.activeTask = &task
+	u.taskMu.Unlock()
+
+	svc, err := u.newService(runCtx)
+	if err != nil {
+		u.taskMu.Lock()
+		u.activeCancel = nil
+		u.activeTask = nil
+		u.taskMu.Unlock()
+		u.setBusy(false, "")
+		u.showError(err)
+		return
+	}
+
+	go func() {
+		var runErr error
+		switch task.kind {
+		case taskDownloadAll:
+			runErr = svc.DownloadAll(task.selection)
+		case taskDownloadOne:
+			runErr = svc.DownloadArticle(task.selection, task.articleIndex)
+		default:
+			return
+		}
+		fyne.Do(func() {
+			u.refreshLogView()
+			if u.finishTask(runErr, true) {
+				return
+			}
+			u.setBusy(false, "")
+			if runErr != nil {
+				u.showError(runErr)
+				return
+			}
+			if task.kind == taskDownloadAll {
+				u.statusLabel.SetText("下载完成")
+			} else {
+				u.statusLabel.SetText("文章下载完成")
+			}
+		})
+	}()
+}
+
 func (u *UI) showError(err error) {
 	u.statusLabel.SetText(err.Error())
 	u.refreshLogView()
@@ -531,9 +719,34 @@ func (u *UI) showError(err error) {
 }
 
 func (u *UI) refreshLogView() {
-	u.logEntry.SetText(readLogFile())
-	u.logEntry.CursorRow = len(strings.Split(u.logEntry.Text, "\n"))
-	u.logEntry.CursorColumn = 0
+	if !u.logTabActive {
+		return
+	}
+	logText := readLogFile()
+	if logText == u.lastLogText {
+		return
+	}
+	u.lastLogText = logText
+	u.logEntry.Text = logText
+	u.logEntry.Refresh()
+	u.logScroll.ScrollToBottom()
+}
+
+func (u *UI) confirmDeleteLog() {
+	dialog.ShowConfirm("删除日志", "确认删除当前日志文件？", func(confirm bool) {
+		if !confirm {
+			return
+		}
+		if err := deleteLogFile(); err != nil {
+			u.showError(err)
+			return
+		}
+		u.lastLogText = ""
+		u.logEntry.Text = "当前还没有日志文件"
+		u.logEntry.Refresh()
+		u.logScroll.ScrollToTop()
+		u.statusLabel.SetText("日志已删除")
+	}, u.window)
 }
 
 func (u *UI) startLogAutoRefresh(ctx context.Context) {
@@ -545,6 +758,9 @@ func (u *UI) startLogAutoRefresh(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if !u.logTabActive {
+					continue
+				}
 				fyne.Do(func() {
 					u.refreshLogView()
 				})

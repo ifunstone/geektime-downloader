@@ -51,6 +51,8 @@ type GetPlayInfoResponse struct {
 	PlayInfoList vod.PlayInfoListInGetPlayInfo `json:"PlayInfoList" xml:"PlayInfoList"`
 }
 
+type ProgressFunc func(downloadedBytes int64, totalBytes int64)
+
 // DownloadArticleVideo download normal video cource ...
 // sourceType: normal video cource 1
 func DownloadArticleVideo(ctx context.Context,
@@ -60,6 +62,7 @@ func DownloadArticleVideo(ctx context.Context,
 	projectDir string,
 	quality string,
 	concurrency int,
+	progress ProgressFunc,
 ) error {
 	logger.Infof("Begin download normal article video, articleID: %d, sourceType: %d", articleID, sourceType)
 	articleInfo, err := client.V3ArticleInfo(articleID)
@@ -80,7 +83,8 @@ func DownloadArticleVideo(ctx context.Context,
 		projectDir,
 		quality,
 		articleInfo.Data.Info.Video.ID,
-		concurrency)
+		concurrency,
+		progress)
 	if err != nil {
 		logger.Errorf(err, "Download normal article video failed, articleID: %d", articleID)
 		return err
@@ -97,6 +101,7 @@ func DownloadEnterpriseArticleVideo(ctx context.Context,
 	projectDir string,
 	quality string,
 	concurrency int,
+	progress ProgressFunc,
 ) error {
 	logger.Infof("Begin download enterprise article video, articleID: %d", articleID)
 	articleInfo, err := client.V1EnterpriseArticleDetail(strconv.Itoa(articleID))
@@ -117,7 +122,8 @@ func DownloadEnterpriseArticleVideo(ctx context.Context,
 		projectDir,
 		quality,
 		articleInfo.Data.Video.ID,
-		concurrency)
+		concurrency,
+		progress)
 	if err != nil {
 		logger.Errorf(err, "Download enterprise article video failed, articleID: %d", articleID)
 		return err
@@ -135,6 +141,7 @@ func DownloadUniversityVideo(ctx context.Context,
 	projectDir string,
 	quality string,
 	concurrency int,
+	progress ProgressFunc,
 ) error {
 	logger.Infof("Begin download university article video, articleID: %d", articleID)
 	playAuthInfo, err := client.UniversityVideoPlayAuth(articleID, currentProduct.ID)
@@ -150,7 +157,8 @@ func DownloadUniversityVideo(ctx context.Context,
 		projectDir,
 		quality,
 		playAuthInfo.Data.VID,
-		concurrency)
+		concurrency,
+		progress)
 	if err != nil {
 		logger.Errorf(err, "Download university article video failed, articleID: %d", articleID)
 		return err
@@ -168,6 +176,7 @@ func downloadAliyunVodEncryptVideo(ctx context.Context,
 	quality,
 	videoID string,
 	concurrency int,
+	progress ProgressFunc,
 ) error {
 	clientRand := uuid.NewString()
 	playInfoURL, err := vod.BuildVodGetPlayInfoURL(playAuth, videoID, clientRand)
@@ -189,11 +198,11 @@ func downloadAliyunVodEncryptVideo(ctx context.Context,
 	if isVodEncryptVideo {
 		decryptKey = crypto.GetAESDecryptKey(clientRand, playInfo.Rand, playInfo.Plaintext)
 	}
-	return download(ctx, tsURLPrefix, videoTitle, projectDir, tsFileNames, []byte(decryptKey), playInfo.Size, isVodEncryptVideo, concurrency)
+	return download(ctx, tsURLPrefix, videoTitle, projectDir, tsFileNames, []byte(decryptKey), playInfo.Size, isVodEncryptVideo, concurrency, progress)
 }
 
 // DownloadMP4 download MP4 resources in article
-func DownloadMP4(ctx context.Context, title, projectDir string, mp4URLs []string, overwrite bool) (err error) {
+func DownloadMP4(ctx context.Context, title, projectDir string, mp4URLs []string, overwrite bool, progress ProgressFunc) (err error) {
 	logger.Infof("Begin download article mp4 videos, title: %s, mp4URLs: %v", title, mp4URLs)
 	filenamifyTitle := filenamify.Filenamify(title)
 	videoDir := filepath.Join(projectDir, "videos", filenamifyTitle)
@@ -213,7 +222,7 @@ func DownloadMP4(ctx context.Context, title, projectDir string, mp4URLs []string
 		headers[geektime.Origin] = geektime.DefaultBaseURL
 		headers[geektime.UserAgent] = geektime.DefaultUserAgent
 		logger.Infof("Begin download single article mp4 video, title: %s, mp4URL: %s", title, mp4URL)
-		_, err := downloader.DownloadFileConcurrently(ctx, dst, mp4URL, headers, 5)
+		_, err := downloader.DownloadFileConcurrently(ctx, dst, mp4URL, headers, 5, downloader.ProgressFunc(progress))
 		if err != nil {
 			logger.Errorf(err, "Failed to download single article mp4 video, title: %s, mp4URL: %s", title, mp4URL)
 			return nil
@@ -233,6 +242,7 @@ func download(ctx context.Context,
 	size int64,
 	isVodEncryptVideo bool,
 	concurrency int,
+	progress ProgressFunc,
 ) (err error) {
 	// Make temp ts folder and download temp ts files
 	filenamifyTitle := filenamify.Filenamify(title)
@@ -258,12 +268,19 @@ func download(ctx context.Context,
 		headers[geektime.Origin] = geektime.DefaultBaseURL
 		headers[geektime.UserAgent] = geektime.DefaultUserAgent
 
-		fileSize, err := downloader.DownloadFileConcurrently(ctx, dst, u, headers, concurrency)
+		fileSize, err := downloader.DownloadFileConcurrently(ctx, dst, u, headers, concurrency, nil)
 		if err != nil {
 			return err
 		}
 
 		addBarValue(bar, fileSize)
+		if progress != nil {
+			current := bar.Current()
+			if current > size {
+				current = size
+			}
+			progress(current, size)
+		}
 	}
 
 	// Read temp ts files, decrypt and merge into the one final video file
