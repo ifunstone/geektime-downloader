@@ -1,0 +1,4 @@
+interface:
+  display_name: "Geektime Downloader Maintainer"
+  short_description: "Guide changes in Geektime Downloader"
+  default_prompt: "Use $geektime-downloader-maintainer to modify or extend this repository safely."

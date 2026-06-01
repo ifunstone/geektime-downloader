@@ -10,11 +10,9 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	fyneapp "fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/nicoxiang/geektime-downloader/internal/app"
@@ -38,9 +36,9 @@ type UI struct {
 	courseLabel       *widget.Label
 	progressBar       *widget.ProgressBar
 	progressDetailLabel *widget.Label
-	logEntry          *canvas.Text
-	logScroll         *container.Scroll
+	logList           *widget.List
 	tabs              *container.AppTabs
+	conversionList    *widget.List
 	loadButton        *widget.Button
 	downloadAllButton *widget.Button
 	downloadOneButton *widget.Button
@@ -48,6 +46,8 @@ type UI struct {
 	cancelButton      *widget.Button
 	refreshLogButton  *widget.Button
 	deleteLogButton   *widget.Button
+	scanTSButton      *widget.Button
+	convertTSButton   *widget.Button
 	saveConfigButton  *widget.Button
 
 	gcidEntry            *widget.Entry
@@ -64,12 +64,18 @@ type UI struct {
 	enterpriseCheck      *widget.Check
 	logLevelSelect       *ScrollableSelect
 	productIDEntry       *widget.Entry
+	conversionFolderEntry *widget.Entry
+	conversionProgressBar *widget.ProgressBar
+	conversionStatusLabel *widget.Label
 
 	taskMu       sync.Mutex
 	activeTask   *downloadTaskState
 	activeCancel context.CancelFunc
 	lastLogText  string
+	logLines     []string
 	logTabActive bool
+	conversionFiles   []conversionFileEntry
+	conversionRunning bool
 }
 
 type appConfigState struct {
@@ -151,10 +157,53 @@ func (u *UI) build(ctx context.Context) {
 	u.progressBar.Hide()
 	u.progressDetailLabel = widget.NewLabel("当前无下载任务")
 	u.progressDetailLabel.Wrapping = fyne.TextWrapWord
-	u.logEntry = canvas.NewText("", theme.Color(theme.ColorNameWarning))
-	u.logEntry.TextStyle = fyne.TextStyle{Monospace: true}
-	u.logEntry.TextSize = theme.TextSize()
-	u.logScroll = container.NewScroll(u.logEntry)
+	u.logList = widget.NewList(
+		func() int {
+			return len(u.logLines)
+		},
+		func() fyne.CanvasObject {
+			label := widget.NewLabel("")
+			label.Wrapping = fyne.TextWrapWord
+			label.TextStyle = fyne.TextStyle{Monospace: true}
+			label.Importance = widget.WarningImportance
+			return label
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id < 0 || id >= len(u.logLines) {
+				obj.(*widget.Label).SetText("")
+				return
+			}
+			label := obj.(*widget.Label)
+			label.TextStyle = fyne.TextStyle{Monospace: true}
+			label.Importance = widget.WarningImportance
+			label.SetText(u.logLines[id])
+		},
+	)
+	u.conversionFolderEntry = widget.NewEntry()
+	u.conversionFolderEntry.SetPlaceHolder("选择包含 ts 视频文件的目录")
+	u.conversionProgressBar = widget.NewProgressBar()
+	u.conversionProgressBar.Min = 0
+	u.conversionProgressBar.Max = 1
+	u.conversionStatusLabel = widget.NewLabel("请选择目录并扫描 ts 文件")
+	u.conversionStatusLabel.Wrapping = fyne.TextWrapWord
+	u.conversionList = widget.NewList(
+		func() int {
+			return len(u.conversionFiles)
+		},
+		func() fyne.CanvasObject {
+			label := widget.NewLabel("")
+			label.Wrapping = fyne.TextWrapWord
+			return label
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id < 0 || id >= len(u.conversionFiles) {
+				obj.(*widget.Label).SetText("")
+				return
+			}
+			file := u.conversionFiles[id]
+			obj.(*widget.Label).SetText(fmt.Sprintf("%s\n-> %s", file.TSPath, file.MP4Path))
+		},
+	)
 
 	u.gcidEntry = widget.NewPasswordEntry()
 	u.gcidEntry.SetPlaceHolder("输入 GCID")
@@ -242,6 +291,12 @@ func (u *UI) build(ctx context.Context) {
 	u.deleteLogButton = widget.NewButton("删除日志", func() {
 		u.confirmDeleteLog()
 	})
+	u.scanTSButton = widget.NewButton("扫描 ts 文件", func() {
+		u.scanTSFiles()
+	})
+	u.convertTSButton = widget.NewButton("转换视频", func() {
+		u.convertTSFiles(ctx)
+	})
 	u.saveConfigButton = widget.NewButton("保存配置", func() {
 		if err := u.persistSettings(); err != nil {
 			u.showError(err)
@@ -253,6 +308,7 @@ func (u *UI) build(ctx context.Context) {
 	u.downloadOneButton.Disable()
 	u.pauseButton.Disable()
 	u.cancelButton.Disable()
+	u.convertTSButton.Disable()
 
 	u.refreshProductOptions()
 	u.restoreSelectedProductType()
@@ -261,11 +317,13 @@ func (u *UI) build(ctx context.Context) {
 	downloadPage := container.NewPadded(u.buildDownloadPage())
 	settingsPage := container.NewPadded(u.buildSettingsPage())
 	logPage := container.NewPadded(u.buildLogPage())
+	conversionPage := container.NewPadded(u.buildConversionPage())
 
 	u.tabs = container.NewAppTabs(
 		container.NewTabItem("下载操作", downloadPage),
 		container.NewTabItem("参数配置", settingsPage),
 		container.NewTabItem("日志查看", logPage),
+		container.NewTabItem("视频转换", conversionPage),
 	)
 	u.tabs.SetTabLocation(container.TabLocationTop)
 	u.tabs.OnSelected = func(item *container.TabItem) {
@@ -337,7 +395,7 @@ func (u *UI) buildLogPage() fyne.CanvasObject {
 		container.NewHBox(u.refreshLogButton, u.deleteLogButton),
 		nil,
 		nil,
-		u.logScroll,
+		u.logList,
 	)
 }
 
@@ -727,9 +785,11 @@ func (u *UI) refreshLogView() {
 		return
 	}
 	u.lastLogText = logText
-	u.logEntry.Text = logText
-	u.logEntry.Refresh()
-	u.logScroll.ScrollToBottom()
+	u.logLines = strings.Split(logText, "\n")
+	u.logList.Refresh()
+	if len(u.logLines) > 0 {
+		u.logList.ScrollToBottom()
+	}
 }
 
 func (u *UI) confirmDeleteLog() {
@@ -742,9 +802,9 @@ func (u *UI) confirmDeleteLog() {
 			return
 		}
 		u.lastLogText = ""
-		u.logEntry.Text = "当前还没有日志文件"
-		u.logEntry.Refresh()
-		u.logScroll.ScrollToTop()
+		u.logLines = []string{"当前还没有日志文件"}
+		u.logList.Refresh()
+		u.logList.ScrollToTop()
 		u.statusLabel.SetText("日志已删除")
 	}, u.window)
 }
